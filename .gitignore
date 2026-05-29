@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# PyInstaller
+build/
+dist/
+*.spec.bak
+
+# IDE
+.idea/
+
+# Logs
+bwrs_error.log
+
+# OS
+Thumbs.db
+desktop.ini

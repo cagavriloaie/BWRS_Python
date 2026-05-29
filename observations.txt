@@ -1,0 +1,209 @@
+BWRS Gas Flow Calculator — Application Observations
+Generated: 2026-05-29
+======================================================================
+
+OVERVIEW
+--------
+Name     : BWRS Gas Flow Calculator v3.0/2026
+Author   : Constantin Agavriloaie  (ELCOST Impex, CJ-RO)
+Language : Python 3.14  (CPython — inferred from __pycache__ artefacts)
+Platform : Windows-primary (PyInstaller .spec present); partial Linux/macOS support in console UI
+Package  : Compiled to BWRS_Calculator.exe via PyInstaller (build/ directory present)
+
+
+PURPOSE
+-------
+Engineering tool that calculates natural-gas mass flow rate through differential-pressure
+flow devices (orifice plates, nozzles, Venturi tubes) using:
+  - BWRS equation of state (Benedict-Webb-Rubin-Starling, Starling 1973) for gas-phase density
+  - Chapman-Enskog dilute-gas viscosity with Chung-Lee-Starling high-density correction
+  - ISO 5167-2/3/4:2003 discharge coefficient (Reader-Harris/Gallagher)
+  - ISO 6976:2016 for calorific values (HHV, LHV, Wobbe index)
+
+
+SUPPORTED SCOPE
+---------------
+Gas components  : 35 (CH4, C2H6, C3H8, iC4, nC4, … CO2, N2, H2, H2S, He, Ar, NH3, C2H2, …)
+Throttling types: 9
+  1. Orifice plate — corner taps
+  2. Orifice plate — flange taps
+  3. Orifice plate — D and D/2 taps
+  4. ISA 1932 nozzle
+  5. Long-radius nozzle
+  6. Classical Venturi tube — rough-cast convergent  (C ≈ 0.984)
+  7. Classical Venturi tube — machined convergent    (C ≈ 0.995)
+  8. Classical Venturi tube — rough-welded sheet-metal convergent (C ≈ 0.985)
+  9. Venturi nozzle                                  (C ≈ 0.983)
+
+Reference conditions (volumetric flow normalisation):
+  - Romania / EU  DIN 1343  :  0 °C and 15 °C  [Nm³/h, Sm³/h]
+  - ISO 13443 / UK / Italy  : 15 °C             [Sm³/h]
+  - USA AGA-3 (60 °F)       : 15.56 °C          [Sm³/h]
+  - Russia GOST 30319-1     : 20 °C             [m³/h]
+  - Custom                  : user-entered °C   [m³/h]
+
+
+ARCHITECTURE — MODULE MAP
+--------------------------
+constants.py          Physical/numeric constants (units, tolerances, ANSI colours)
+models.py             Dataclasses (BwrConst, FlowResult, MixtureThermo, CountryRef)
+                      Enums: DeviceType (IntEnum, 1–9), ErrorCode (IntEnum, 1–5)
+data/components.py    Lookup tables for all 35 components:
+                      BWRS_A0..E0, BWRS_A..DV, ALFA, GAMA, MOLAR_MASS_TABLE,
+                      TEMP/PRESS/Z_CRITICAL_TABLE, HHV_TABLE, LHV_TABLE,
+                      VISC_CS_PARAM, VISC_ET_PARAM, CP0_IDEAL
+formulas/bwrs.py      calc_bwr_mixture()   — Starling quadratic + cubic mixing rules
+                      calc_density()       — bisection solver (gas-phase density)
+                      calc_mixture_thermo()— Kay's rule for pseudo-critical properties
+                      calc_kappa()         — isentropic exponent from ideal Cp°
+formulas/viscosity.py calc_viscosity()     — Chapman-Enskog + high-density correction
+standards/iso5167.py  discharge_coefficient(), velocity_coefficient()
+                      calc_mass_flow()     — Reynolds iteration loop
+ui/gui.py             tkinter GUI (BwrsApp class, 5 tabs)
+ui/console.py         Windows/Linux console UI with ANSI colour output
+tests/validation.py   run_validation_test() — checks vs. NIST WebBook, AGA-8, ISO 5167 estimates
+main_gui.py           Entry point — launches GUI via ui.gui.run()
+
+
+NUMERICAL METHODS
+-----------------
+Density      : Adaptive-bracket bisection (up to 200 iterations, tolerance 5e-4 atm)
+               — robust but slower than Newton-Raphson; safe for gas-phase only
+Mass flow    : Reynolds-number iteration (up to 100 iterations, tolerance 1e-6)
+BWRS mixing  : Quadratic (N²) rules for A0/B0/C0/D0/E0/γ
+               Cubic (N³) rules for a/b/c/d/α  → N=35: 42,875 inner iterations
+               Converges fast but is expensive for embedded targets (see CPU profile)
+Expansibility: Exact isentropic formula for nozzles/Venturi; linear approximation for orifices
+
+
+GUI (ui/gui.py) — DETAILS
+--------------------------
+Framework   : tkinter + ttk (standard library, no external UI dependency)
+Window      : 1000×740 px, minimum 840×580
+Theme order : clam → alt → default (first available)
+Tabs (5)    :
+  1. Compoziție  — scrollable 2-column grid of 35 molar fraction entries;
+                   live sum display; Load/Save/Normalize/Apply buttons
+  2. Dispozitiv  — throttling device combobox; D and d inputs; β display;
+                   reference condition radio buttons; Save Config button
+  3. Condiții    — centred input panel: T [°C], P [kPa], ΔP [kPa]; CALCULEAZĂ button
+  4. Rezultate   — dark-mode ScrolledText (Courier New 11); syntax-coloured output;
+                   Copy to clipboard and Save .txt buttons; horizontal scrollbar
+  5. Testare     — threaded validation runner; colour-coded PASS/FAIL output;
+                   built-in legend describing all symbols and reference sources
+
+Persistence : bwrs_comp.json  (35 molar fractions)
+              bwrs_conf.json  (tip index, D mm, d mm)
+              Both auto-loaded on startup; saved on demand.
+
+Thread safety: Test runner uses threading.Thread + self.after() callback — correct.
+               stdout redirected to StringIO during test run; restored in finally block.
+
+
+CONSOLE UI (ui/console.py) — DETAILS
+--------------------------------------
+Colour output : ANSI escape codes; Windows VT processing enabled via ctypes (SetConsoleMode)
+Input model   : Character-by-character (msvcrt on Windows; tty/termios on Linux/macOS)
+                Single-key choices (read_choice), floating-point entry (read_double)
+Features      : Composition input/save/load, device selection, reference selection,
+                flow results, CPU profile table, measurement uncertainty (ISO 5167-1)
+CPU profile   : Estimates execution time on 13 embedded targets
+                (ARM Cortex-M7/M4/M33/M3, Xtensa LX6/LX7, RISC-V, MSP430, AVR, Z80)
+Uncertainty   : Propagated per ISO 5167-1 (six uncertainty sources: C, ε, d, D, Δp, ρ);
+                expanded uncertainty U (k=2, 95 % coverage) reported in kg/s and m³/h
+
+
+VALIDATION (tests/validation.py)
+----------------------------------
+Checks per gas mixture:
+  - ρ at 20 °C and 0 °C, 101.325 kPa  vs. BWRS 1973 reference ranges
+  - η at 20 °C vs. Chapman-Enskog / NIST estimates
+  - Z at 20 °C, 101.325 kPa  (expected range 0.975–1.003 for gas phase)
+  - Molar mass consistency (mixing rule vs. direct sum, tolerance 1e-8)
+  - Mass flow Qm for all 9 device types vs. approximate ISO 5167 formula
+  - Additional checks: ρ monotonicity (T and P), ideal-gas ratio, single-phase Z range,
+    quasi-ideal limit at P ≤ 500 kPa, density ratio between two gases
+
+
+OBSERVATIONS & POTENTIAL ISSUES
+---------------------------------
+1. Language inconsistency:
+   - GUI tab labels and result fields are in Romanian (Compoziție, Dispozitiv, Condiții…)
+   - Console UI output is in English
+   - Validation test output is in English
+   Recommendation: choose one language for consistency, or add a locale switch.
+
+2. Fragile sys.path hacks:
+   - formulas/bwrs.py and formulas/viscosity.py both contain sys.path.insert(0, '..')
+   - These work only if the module is run from its own directory, not when imported
+     from main_gui.py or from the PyInstaller bundle.
+   Recommendation: remove these lines; they are redundant when the package is imported
+   normally, and they silently break when the CWD differs.
+
+3. O(N³) BWRS cubic mixing rule:
+   - With N=35 components, the cubic loop runs 35³ = 42,875 iterations on every call to
+     calc_bwr_mixture().  For single calculations this is fast on a PC, but the CPU profile
+     confirms it could be ~5 s on an 8 MHz Z80.
+   - Optimisation: skip (x[i]*x[j]*x[l]) triples that are effectively zero early (currently
+     done for the quadratic loop but the cubic loop only skips fully-zero fractions).
+
+4. Density solver — bisection only:
+   - The current solver is robust but converges linearly (up to 200 iterations).
+   - A Newton-Raphson step after bisection would converge quadratically from a good initial
+     estimate and reduce average iteration count significantly.
+
+5. No console entry point at the top level:
+   - main_gui.py launches the GUI only.  There is no main_console.py or CLI flag.
+   - The console UI exists but is only reachable by running ui/console.py directly,
+     which requires the fragile sys.path hacks to resolve imports.
+
+6. Error reporting in ISO 5167 leaks to stdout:
+   - print_error() in standards/iso5167.py prints directly to sys.stdout.
+   - In GUI mode, stdout is redirected to StringIO only during the test run, not during
+     a normal calc_mass_flow() call.  Error messages from print_error() during _calculate()
+     will appear in the terminal (if any) but not in the GUI.
+   Recommendation: raise exceptions or return error codes instead of printing.
+
+7. Input validation ordering in _calculate():
+   - The GUI validates T, P, ΔP, D, d, β before calling BWRS, which is correct.
+   - However, the ISO 5167 β validity check in _calculate() uses the nominal β (not the
+     thermally corrected β used inside calc_mass_flow), so edge-case inputs near the β
+     boundary could pass GUI validation but still fail inside iso5167.
+
+8. Magic numbers in iso5167.py:
+   - Pressure-loss coefficients for Venturi tubes (0.15, 0.08) are literal values without
+     reference comments.  ISO 5167-4 specifies these; a short reference comment would help.
+
+9. JSON persistence — no schema validation:
+   - bwrs_comp.json is loaded and the length is checked (must equal NUM_COMPONENTS=35),
+     but individual values are not range-checked on load (could be negative or >1).
+   - bwrs_conf.json likewise; a missing key would raise KeyError inside load_config().
+
+10. PyInstaller build:
+    - The BWRS_Calculator.spec file exists and build/ artefacts are present.
+    - The spec file should be reviewed to ensure bwrs_comp.json and bwrs_conf.json are
+      bundled or written to the executable's directory at runtime (not to the frozen bundle).
+
+11. No logging framework:
+    - Errors go to print() calls with ANSI colour codes.  There is no log file or Python
+      logging module usage, making post-mortem diagnosis harder in production deployments.
+
+12. Positive: clean separation of concerns:
+    - Physics (formulas/), standards (standards/), data (data/), UI (ui/), tests (tests/)
+      are well-separated.  Adding a new device type requires only changes to models.py and
+      standards/iso5167.py.
+
+13. Positive: comprehensive validation suite:
+    - Covers density, viscosity, Z-factor, molar mass, and flow rate for multiple
+      compositions and all 9 device types.  PASS/FAIL with reference source cited.
+
+14. Positive: thermal expansion correction:
+    - Both pipe (carbon steel, 12.2e-6 /°C) and orifice (SS, 16.5e-6 /°C) thermal
+      expansion are applied before β and diameter range checks — metrologically correct.
+
+15. Positive: uncertainty propagation (console only):
+    - ISO 5167-1 uncertainty calculation is present in the console UI with sensitivity
+      factors and six input uncertainty sources.  This feature is absent from the GUI.
+
+======================================================================
+End of observations

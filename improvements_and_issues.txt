@@ -1,0 +1,378 @@
+BWRS Gas Flow Calculator — Improvements & Issues Report
+Generated: 2026-05-29
+======================================================================
+
+This document lists all defects and potential improvements found after a
+full read of the source code (constants.py, models.py, data/components.py,
+formulas/bwrs.py, formulas/viscosity.py, standards/iso5167.py, ui/gui.py,
+tests/validation.py, main_gui.py, BWRS_Calculator.spec).
+
+Severity key:
+  [CRITICAL] — application crashes or produces wrong results
+  [BUG]      — incorrect behaviour in specific scenarios
+  [MEDIUM]   — design problem that will cause trouble in production
+  [MINOR]    — code-quality issue, inconsistency, or maintenance risk
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CRITICAL — Application-level failures
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+C-1. Missing ANSI colour constants in constants.py
+     Files : standards/iso5167.py (line 7–8)
+             tests/validation.py (lines 6–9)
+     Problem: iso5167.py imports COLOR_BOLD_RED and COLOR_RESET from
+     constants at module level. tests/validation.py imports COLOR_YELLOW,
+     COLOR_BOLD_WHITE, COLOR_BOLD_GREEN, COLOR_BOLD_RED, COLOR_RESET.
+     None of these exist in the current constants.py (48 lines, ends at
+     MJ_PER_KWH). Because ui/gui.py imports from standards.iso5167 at
+     startup, the entire GUI fails immediately with:
+       ImportError: cannot import name 'COLOR_BOLD_RED' from 'constants'
+     Fix: Add the missing colour constants to constants.py, e.g.:
+       COLOR_RESET     = "\033[0m"
+       COLOR_BOLD_RED  = "\033[1;31m"
+       COLOR_BOLD_GREEN= "\033[1;32m"
+       COLOR_YELLOW    = "\033[33m"
+       COLOR_BOLD_WHITE= "\033[1;37m"
+     Or remove the print_error() stdout call from iso5167.py and return
+     only the string (see C-2 / M-4 below).
+
+C-2. ui/console.py does not exist as a source file
+     Files : tests/validation.py (line 214)
+             ui/gui.py _tests_worker (lines 685–688)
+     Problem: tests/validation.py ends with `from ui.console import
+     wait_key` and calls wait_key(). The gui.py test worker does
+     `import ui.console as con; _orig_wait = con.wait_key` before
+     running the validation. There is no ui/console.py in the project —
+     the file listing confirms it is absent (no source file, no pyc
+     cache for it either). Clicking "Run validation tests" in the GUI
+     will raise ModuleNotFoundError.
+     Fix: Create ui/console.py with at minimum:
+       def wait_key():
+           input()   # or msvcrt.getch() on Windows
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+BUG — Incorrect behaviour in specific scenarios
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+B-1. GUI β-check uses nominal (20 °C) diameters; iso5167 uses thermal-
+     expansion-corrected diameters
+     File : ui/gui.py lines 969–974
+     Problem: _calculate() computes beta = d_orif / d_int (both at 20 °C)
+     and rejects if beta < 0.10 or > 0.80. Inside calc_mass_flow() the
+     diameters are corrected for the measurement temperature:
+       d_pipe_t  = d_int  * (1 + α_pipe  * (T - 20))
+       d_orif_t  = d_orif * (1 + α_orifice * (T - 20))
+     and then beta_corrected = d_orif_t / d_pipe_t.
+     For an orifice at e.g. 300 °C, the two expansion coefficients
+     differ (12.2e-6 vs 16.5e-6), so beta_corrected can drift from the
+     nominal beta by ~0.001–0.002. A set of diameters just inside the
+     ISO 5167 beta limit (e.g. β = 0.799 nominal for an orifice plate)
+     could pass the GUI pre-check but fail or vice versa inside iso5167.
+     The user sees no clear explanation.
+     Fix: compute the corrected beta in _calculate() and use it for the
+     pre-check (or remove the GUI beta pre-check and rely solely on the
+     calc_mass_flow() validation).
+
+B-2. Density tolerance is absolute in atm, not relative
+     File : constants.py line 15 (DENSITY_TOLERANCE = 5.0e-4)
+             formulas/bwrs.py line 162
+     Problem: `if abs(p - p_cal) < DENSITY_TOLERANCE` compares an
+     absolute pressure error in atm. At low pressures (~0.1 atm) the
+     relative tolerance is 0.5 %, which may be too coarse for accurate
+     density. At very high pressures (100 atm) it converges 200× faster
+     than needed, wasting iterations only when the solution is near.
+     Fix: replace with a relative check:
+       tol = max(DENSITY_TOLERANCE, abs(p) * 1e-6)
+       if abs(p - p_cal) < tol: ...
+
+B-3. BWRS_B0[3] (propane) data value is anomalously large
+     File : data/components.py line 36
+     Value: 97.313/100 = 0.97313
+     Problem: all other BWRS_B0 values are in the range 0.022–0.21.
+     Propane's B0 at 0.97 is roughly 5–40× larger than any neighbour.
+     If this is a transcription error from Starling 1973 (the original
+     may be 9.7313 → /100 = 0.097313), the computed mixture density for
+     propane-containing gases will be wrong.
+     Fix: cross-check against Starling 1973, Table 3. If the correct
+     value is 0.097313, replace `97.313/100` with `9.7313/100`.
+
+B-4. Viscosity parameter ξ uses Tc^6 instead of Tc^(1/6)
+     File : formulas/bwrs.py line 180
+     Code : thermo.m_csi = (tc_mix ** 6) / math.sqrt(bwr.m_molarMass)
+                           / (pc_mix * pc_mix) ** (1/3)
+     Problem: the Chapman-Enskog/Nishiumi-Saito viscosity correlation
+     defines the mixture parameter as:
+       ξ = Tc^(1/6) / (M^(1/2) · Pc^(2/3))
+     The code uses Tc^6 (exponent 6 instead of 1/6), producing values
+     ~10^11 for typical gases. This makes the high-density correction
+     term (VISC_HIGH_A / csi) × ... essentially zero for all practical
+     conditions, so the implementation degrades to dilute-gas only.
+     The built-in validation tests pass at low pressure (101.325 kPa)
+     because the density correction is negligible there, but viscosity
+     will be wrong at elevated pressures.
+     Fix: change `tc_mix ** 6` to `tc_mix ** (1/6)`.
+     Note: verify against Nishiumi & Saito (1975) before changing, in
+     case the constant VISC_HIGH_A was intentionally tuned for the
+     current formula.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+MEDIUM — Design problems / production concerns
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+M-1. JSON config/composition files not bundled in PyInstaller spec
+     File : BWRS_Calculator.spec line 8 (datas=[])
+     Problem: bwrs_comp.json and bwrs_conf.json are opened via relative
+     paths (COMP_FILE = "bwrs_comp.json", CONF_FILE = "bwrs_conf.json").
+     In a frozen PyInstaller executable, os.getcwd() is typically the
+     system temp directory where the bundle extracts, not the directory
+     containing the .exe. Loading silently fails (the bare except pass
+     in _try_load_config / _try_load_composition hides the error), and
+     saving creates files in the wrong location.
+     Fix: use sys.executable or __file__ to build a path relative to the
+     exe, e.g.:
+       BASE_DIR = os.path.dirname(os.path.abspath(sys.executable
+                  if getattr(sys, 'frozen', False) else __file__))
+       COMP_FILE = os.path.join(BASE_DIR, "bwrs_comp.json")
+
+M-2. CALCULATE runs on the main Tkinter thread
+     File : ui/gui.py method _calculate (line 913)
+     Problem: _calculate() calls calc_bwr_mixture() (O(N³) for N=35),
+     calc_density() (up to 200 bisection steps), calc_viscosity(), and
+     calc_mass_flow() all synchronously on the event-loop thread. On a
+     slow machine or with a 35-component mixture the UI will freeze
+     (unresponsive, greyed-out) for the duration of the calculation with
+     no progress feedback to the user.
+     Fix: mirror the pattern used for the test runner — disable the
+     CALCULATE button, run the computation in a daemon thread, and post
+     results back via self.after(0, ...).
+
+M-3. Error messages from calc_mass_flow() leak to stdout in GUI mode
+     File : standards/iso5167.py lines 12–22 (print_error)
+     Problem: print_error() calls print(...) to sys.stdout. During a
+     normal _calculate() call the GUI does not redirect stdout, so error
+     messages from range violations appear only in the terminal (if one
+     exists) and not in the GUI. The return value of print_error() IS
+     propagated back through calc_mass_flow() as an error string and IS
+     shown in the GUI via _status_lbl — so the GUI display is correct —
+     but the stdout print is redundant and clutters the console.
+     Fix: remove the print() call from print_error(); return only the
+     string. Callers that need console output can print the returned
+     string themselves.
+
+M-4. sys.path.insert(0, ...) hacks are fragile
+     Files : ui/gui.py line 13
+             tests/validation.py line 4
+     Problem: inserting the project root into sys.path at import time
+     works only when the CWD or __file__ is within the project tree, and
+     only when the module is not already importable via the normal path.
+     When launched via main_gui.py (which already inserts the project
+     root at line 5), the gui.py insert is harmless but misleading. In
+     a PyInstaller bundle, os.path.dirname(os.path.abspath(__file__)) is
+     inside the temp-extracted bundle, not the project root.
+     Fix: remove the sys.path.insert lines from gui.py and
+     tests/validation.py. The project root insert in main_gui.py is
+     sufficient when running from source; PyInstaller handles imports
+     from the bundle automatically.
+
+M-5. No console entry point at project root level
+     Problem: The console UI (when restored) is only reachable by
+     running ui/console.py directly, which also requires the sys.path
+     hack. There is no main_console.py alongside main_gui.py.
+     Fix: add main_console.py mirroring main_gui.py:
+       sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+       from ui.console import run
+       if __name__ == "__main__":
+           run()
+
+M-6. No loading indicator for CALCULATE
+     File : ui/gui.py
+     Problem: while the computation runs on the main thread (see M-2)
+     there is no spinner, progress bar change, or cursor change. The
+     user cannot tell whether the app has frozen or is computing.
+     Fix: change cursor to "watch", update the status bar to
+     "Calculating...", and restore after. (Properly fixed by M-2.)
+
+M-7. _try_load_config silently swallows all exceptions
+     File : ui/gui.py lines 882–884
+     Code : except Exception: pass
+     Problem: if bwrs_conf.json is malformed JSON, missing keys, or has
+     a corrupted tip index, no error is shown. The user sees default
+     values and may not notice that their saved configuration was lost.
+     Fix: show a non-blocking warning (e.g., set the status bar to
+     "Warning: could not load configuration — using defaults") instead
+     of silently passing.
+
+M-8. Uncertainty propagation (ISO 5167-1) absent from GUI
+     Problem: the observations confirm that the console UI implements
+     ISO 5167-1 measurement uncertainty (six sources: C, ε, d, D, Δp,
+     ρ) but this feature is absent from the GUI. The help text
+     (line 1227) mentions it as a GUI feature: "Measurement uncertainty
+     (console mode, ISO 5167-1)" — which is contradictory.
+     Fix: port the uncertainty module to the GUI and add an Uncertainty
+     section to the results report, or correct the help text to clarify
+     it is console-only.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+MINOR — Code quality, consistency, maintenance
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+N-1. Language inconsistency in test legend
+     File : ui/gui.py line 584
+     Code : ("  ● Rezultat general", ...) inside the legend
+     Problem: "Rezultat general" is Romanian; all other legend items are
+     English ("PASS", "FAIL / ERROR", "Section / Header", "Normal").
+     Fix: change to "General result" for consistency.
+
+N-2. Import of GAS_CONSTANT_R, KELVIN_OFFSET, MOLAR_MASS_TABLE inside
+     test_comp() on every call
+     File : tests/validation.py lines 56–61
+     Problem: `from constants import ...` and `from data.components
+     import ...` inside test_comp() execute a dictionary lookup on every
+     call (8 times). Python caches the module, so this is a very minor
+     overhead, but it is also a style issue — module-level imports are
+     conventional and easier to track.
+     Fix: move these imports to the top of the file with the other
+     module-level imports.
+
+N-3. Pressure-loss fractions for Venturi tubes are undocumented
+     File : standards/iso5167.py lines 199–204
+     Values: 0.15 (rough-cast), 0.08 (machined), 0.15 (welded sheet)
+     Problem: these constants are given without a reference comment.
+     ISO 5167-4:2003 Table 1 is the source. The values are correct but
+     a reader or maintainer cannot verify them at a glance.
+     Fix: add a short comment, e.g.:  # ISO 5167-4:2003 Table 1
+
+N-4. JSON persistence has no schema version
+     Files : ui/gui.py _load_composition / _save_composition
+     Problem: if a future version changes the number of components or
+     adds metadata, the existing length check will give an unhelpful
+     error. Without a version field there is no migration path.
+     Fix: add "version": 1 to the JSON. Check it on load and provide a
+     clear error message if the version is unknown.
+
+N-5. Calorific values use fixed ideal-gas molar volumes, not BWRS
+     File : ui/gui.py lines 1100–1105
+     Code : hhv_0c  = hhv_mol / MOLAR_VOL_0C
+            hhv_15c = hhv_mol / MOLAR_VOL_15C  etc.
+     Problem: the code uses constant ideal-gas molar volumes (22.414 L/mol
+     at 0°C, 23.645 L/mol at 15°C, 24.055 L/mol at 20°C) rather than the
+     BWRS-computed density at those conditions. ISO 6976:2016 mandates
+     ideal-gas reference conditions for calorific values, so this is
+     technically correct — but there is no comment explaining why BWRS is
+     not used here, which can confuse maintainers.
+     Fix: add a comment:  # ISO 6976:2016 sec. 5: ideal-gas molar volumes
+
+N-6. bwrs_conf.json hard-coded D=100 / d=50 initial state
+     File : bwrs_conf.json
+     Problem: the saved configuration has D=100 mm, d=50 mm (β=0.5).
+     For a user who never ran the GUI before, these defaults are
+     reasonable. But because d=50 mm is the Venturi nozzle orifice lower
+     limit (the check in iso5167.py line 109 is `d_orif_t <= 50`, so the
+     boundary is included), a Venturi nozzle calculation with these
+     exact defaults will be rejected with an orifice diameter error.
+     Fix: use d=51 mm or add a note in the UI; or simply verify that the
+     default pair passes all nine device types.
+
+N-7. PyInstaller spec has console=False with no fallback error handler
+     File : BWRS_Calculator.spec line 33
+     Problem: console=False suppresses the Windows console window. Any
+     unhandled exception that escapes tkinter's event loop (e.g., an
+     ImportError before the window is created) produces no visible output
+     to the user — the process silently exits. Until C-1 and C-2 are
+     fixed, a user who launches BWRS_Calculator.exe will see nothing.
+     Fix: wrap the run() call in main_gui.py with try/except and write
+     errors to a log file, or use a messagebox as a last resort:
+       try:
+           from ui.gui import run
+           run()
+       except Exception as exc:
+           import tkinter, traceback
+           tkinter.messagebox.showerror("Startup error", traceback.format_exc())
+
+N-8. Composition tab: FocusOut triggers _update_sum but tab-key between
+     fields fires FocusOut immediately
+     File : ui/gui.py line 403–404
+     Code : e.bind("<FocusOut>", lambda _ev: self._update_sum())
+     Problem: every FocusOut triggers a full loop over all 35 entries.
+     This is harmless but slightly wasteful. More importantly, the
+     closure in the lambda always captures the variable `e` from the
+     enclosing scope (last assigned value of `e`), not the specific
+     entry being left. This is the classic "closure in a loop" issue.
+     In this case the lambda body ignores `e` and only calls
+     _update_sum(), so there is no actual bug — but it is a common
+     pitfall worth noting for future maintenance.
+     Fix: use a default-argument capture if the specific entry is ever
+     needed: lambda _ev, _e=e: self._update_sum()
+
+N-9. calc_bwr_mixture skips triples based on xi*xj < 1e-12 but the
+     threshold comment is slightly misleading
+     File : formulas/bwrs.py line 63
+     Code : if xij < _TRIPLE_THRESH: continue
+     Comment: "x[i]*x[j]*x[l] ≤ xij < threshold for any x[l]≤1"
+     Problem: the comment is logically correct (any x[l]≤1 means
+     xi*xj*xl ≤ xi*xj = xij < threshold), but the reader has to think
+     twice. Also, with 35 components at even fractions (~0.03 each),
+     xi*xj ≈ 0.0009, which is far above 1e-12, so the optimisation
+     never fires for realistic mixtures; its only use is degenerate
+     single-component inputs.
+     Fix: clarify comment or raise threshold to, say, 1e-9 to make the
+     optimisation useful for trace components (<0.001 molar fraction).
+
+N-10. No loading spinner or busy cursor during composition Apply
+      File : ui/gui.py _apply_composition (line 800)
+      Problem: calc_bwr_mixture(), calc_kappa(), and calc_mixture_thermo()
+      all run synchronously in the event loop when "Apply composition" is
+      clicked. For a 35-component mixture this is fast (~1 ms on modern
+      hardware), but there is no visual feedback to indicate the button
+      was registered.
+      Fix: this is low-priority but could change button text to
+      "Applying…" and restore it in an after(0, ...) callback.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+POSITIVE OBSERVATIONS (things that work well)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
++ Hybrid bisection + Newton-Raphson density solver (bwrs.py lines
+  154–160) is a significant improvement over pure bisection — NR steps
+  are accepted only when they stay within the bracket, making it both
+  robust and fast.
+
++ Thermal expansion correction is applied before beta/diameter range
+  checks in calc_mass_flow(), which is metrologically correct.
+
++ Thread safety in the test runner: threading.Thread + self.after(0, ...)
+  pattern is correct. stdout is redirected in the worker thread and
+  restored in a finally block. UI updates are posted back to the event
+  loop safely.
+
++ ANSI colour stripping in _display_test_output() (line 705) ensures
+  the GUI shows clean text regardless of whether the validation code
+  emits escape sequences.
+
++ calc_bwr_mixture() precomputes all (v_sq, v_cb, k_pair) and the six
+  cube-root dicts once per call, avoiding redundant pow() calls inside
+  the N² and N³ loops.
+
++ Comprehensive validation suite covers density (two temperatures),
+  viscosity, Z-factor, molar mass, and Qm for all 9 device types across
+  8 compositions, plus ISO 5167 negative tests and monotonicity checks.
+
++ Expansibility factor ε uses the exact isentropic formula for
+  nozzles/Venturi tubes and the ISO 5167-2 linear approximation for
+  orifice plates — consistent with the standard.
+
+
+======================================================================
+Summary count:
+  CRITICAL  : 2
+  BUG       : 4
+  MEDIUM    : 8
+  MINOR     : 10
+  Positives : 7
+======================================================================
+End of report
